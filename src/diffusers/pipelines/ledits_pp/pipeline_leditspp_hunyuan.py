@@ -13,24 +13,34 @@
 # limitations under the License.
 
 import inspect
-from typing import Callable, Dict, List, Optional, Tuple, Union
+import math
+from typing import Callable, Dict, List, Optional, Tuple, Union, Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import BertModel, BertTokenizer, CLIPImageProcessor, MT5Tokenizer, T5EncoderModel, CLIPVisionModelWithProjection
 
-from ...pipelines.stable_diffusion import StableDiffusionPipelineOutput
-
+from ...image_processor import PipelineImageInput, VaeImageProcessor
+from .. import LEditsPPInversionPipelineOutput
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
 from ...image_processor import VaeImageProcessor
+from ...models.attention_processor import Attention
 from ...models import AutoencoderKL, HunyuanDiT2DModel
 from ...models.embeddings import get_2d_rotary_pos_embed
+from ...pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from ...pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-from ...schedulers import DDPMScheduler
+from ...schedulers import DDPMScheduler, DDIMScheduler, DPMSolverMultistepScheduler
 from ...utils import (
     is_torch_xla_available,
     logging,
     replace_example_docstring,
+)
+from ...loaders import (
+    FromSingleFileMixin,
+    IPAdapterMixin,
+    StableDiffusionXLLoraLoaderMixin,
+    TextualInversionLoaderMixin,
 )
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline
@@ -42,17 +52,8 @@ if is_torch_xla_available():
 else:
     XLA_AVAILABLE = False
 
-PipelineImageInput = Union[
-    PIL.Image.Image,
-    np.ndarray,
-    torch.Tensor,
-    List[PIL.Image.Image],
-    List[np.ndarray],
-    List[torch.Tensor],
-]
-
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-# todo
+# todo write docstring
 EXAMPLE_DOC_STRING = """
     Examples:
         ```py
@@ -162,8 +163,187 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     return noise_cfg
 
 
-class LEditsPPPipelineHunyuan(DiffusionPipeline):
-    # todo
+# Copied from diffusers.pipelines.ledits_pp.pipeline_leditspp_stable_diffusion.LeditsAttentionStore
+class LeditsAttentionStore:
+    @staticmethod
+    def get_empty_store():
+        return {"down_cross": [], "mid_cross": [], "up_cross": [], "down_self": [], "mid_self": [], "up_self": []}
+
+    def __call__(self, attn, is_cross: bool, place_in_unet: str, editing_prompts, PnP=False):
+        # attn.shape = batch_size * head_size, seq_len query, seq_len_key
+        if attn.shape[1] <= self.max_size:
+            bs = 1 + int(PnP) + editing_prompts
+            skip = 2 if PnP else 1  # skip PnP & unconditional
+            attn = torch.stack(attn.split(self.batch_size)).permute(1, 0, 2, 3)
+            source_batch_size = int(attn.shape[1] // bs)
+            self.forward(attn[:, skip * source_batch_size :], is_cross, place_in_unet)
+
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
+
+        self.step_store[key].append(attn)
+
+    def between_steps(self, store_step=True):
+        if store_step:
+            if self.average:
+                if len(self.attention_store) == 0:
+                    self.attention_store = self.step_store
+                else:
+                    for key in self.attention_store:
+                        for i in range(len(self.attention_store[key])):
+                            self.attention_store[key][i] += self.step_store[key][i]
+            else:
+                if len(self.attention_store) == 0:
+                    self.attention_store = [self.step_store]
+                else:
+                    self.attention_store.append(self.step_store)
+
+            self.cur_step += 1
+        self.step_store = self.get_empty_store()
+
+    def get_attention(self, step: int):
+        if self.average:
+            attention = {
+                key: [item / self.cur_step for item in self.attention_store[key]] for key in self.attention_store
+            }
+        else:
+            assert step is not None
+            attention = self.attention_store[step]
+        return attention
+
+    def aggregate_attention(
+        self, attention_maps, prompts, res: Union[int, Tuple[int]], from_where: List[str], is_cross: bool, select: int
+    ):
+        out = [[] for x in range(self.batch_size)]
+        if isinstance(res, int):
+            num_pixels = res**2
+            resolution = (res, res)
+        else:
+            num_pixels = res[0] * res[1]
+            resolution = res[:2]
+
+        for location in from_where:
+            for bs_item in attention_maps[f"{location}_{'cross' if is_cross else 'self'}"]:
+                for batch, item in enumerate(bs_item):
+                    if item.shape[1] == num_pixels:
+                        cross_maps = item.reshape(len(prompts), -1, *resolution, item.shape[-1])[select]
+                        out[batch].append(cross_maps)
+
+        out = torch.stack([torch.cat(x, dim=0) for x in out])
+        # average over heads
+        out = out.sum(1) / out.shape[1]
+        return out
+
+    def __init__(self, average: bool, batch_size=1, max_resolution=16, max_size: int = None):
+        self.step_store = self.get_empty_store()
+        self.attention_store = []
+        self.cur_step = 0
+        self.average = average
+        self.batch_size = batch_size
+        if max_size is None:
+            self.max_size = max_resolution**2
+        elif max_size is not None and max_resolution is None:
+            self.max_size = max_size
+        else:
+            raise ValueError("Only allowed to set one of max_resolution or max_size")
+
+# Copied from diffusers.pipelines.ledits_pp.pipeline_leditspp_stable_diffusion.LeditsGaussianSmoothing
+class LeditsGaussianSmoothing:
+    def __init__(self, device):
+        kernel_size = [3, 3]
+        sigma = [0.5, 0.5]
+
+        # The gaussian kernel is the product of the gaussian function of each dimension.
+        kernel = 1
+        meshgrids = torch.meshgrid([torch.arange(size, dtype=torch.float32) for size in kernel_size])
+        for size, std, mgrid in zip(kernel_size, sigma, meshgrids):
+            mean = (size - 1) / 2
+            kernel *= 1 / (std * math.sqrt(2 * math.pi)) * torch.exp(-(((mgrid - mean) / (2 * std)) ** 2))
+
+        # Make sure sum of values in gaussian kernel equals 1.
+        kernel = kernel / torch.sum(kernel)
+
+        # Reshape to depthwise convolutional weight
+        kernel = kernel.view(1, 1, *kernel.size())
+        kernel = kernel.repeat(1, *[1] * (kernel.dim() - 1))
+
+        self.weight = kernel.to(device)
+
+    def __call__(self, input):
+        """
+        Arguments:
+        Apply gaussian filter to input.
+            input (torch.Tensor): Input to apply gaussian filter on.
+        Returns:
+            filtered (torch.Tensor): Filtered output.
+        """
+        return F.conv2d(input, weight=self.weight.to(input.dtype))
+
+
+# Copied from diffusers.pipelines.ledits_pp.pipeline_leditspp_stable_diffusion.LEDITSCrossAttnProcessor
+class LEDITSCrossAttnProcessor:
+    def __init__(self, attention_store, place_in_unet, pnp, editing_prompts):
+        self.attnstore = attention_store
+        self.place_in_unet = place_in_unet
+        self.editing_prompts = editing_prompts
+        self.pnp = pnp
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states,
+        encoder_hidden_states,
+        attention_mask=None,
+        temb=None,
+    ):
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        query = attn.to_q(hidden_states)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        self.attnstore(
+            attention_probs,
+            is_cross=True,
+            place_in_unet=self.place_in_unet,
+            editing_prompts=self.editing_prompts,
+            PnP=self.pnp,
+        )
+
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+        return hidden_states
+
+
+class LEditsPPPipelineHunyuan(
+    DiffusionPipeline,
+    FromSingleFileMixin,
+    StableDiffusionXLLoraLoaderMixin,
+    TextualInversionLoaderMixin,
+    IPAdapterMixin,
+):
+    # todo write docstring
     r"""
    Pipeline for textual image editing using LEDits++ with HunyuanDiT.
 
@@ -223,8 +403,7 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
             requires_safety_checker: bool = True,
             text_encoder_2=T5EncoderModel,
             tokenizer_2=MT5Tokenizer,
-            # force_zeros_for_empty_prompt: bool = True,
-            # add_watermarker: Optional[bool] = None,
+            force_zeros_for_empty_prompt: bool = True,
     ):
         super().__init__()
 
@@ -257,6 +436,7 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
                 " checker. If you do not want to use the safety checker, you can pass `'safety_checker=None'` instead."
             )
 
+        self.register_to_config(force_zeros_for_empty_prompt=force_zeros_for_empty_prompt)
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
@@ -271,11 +451,12 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
             max_sequence_length: Optional[int] = None,
             do_classifier_free_guidance: bool = True,
             clip_skip: Optional[int] = None,
+            enable_edit_guidance: bool = True,
             negative_prompt: Optional[torch.Tensor] = None,
+            negative_prompt_2: Optional[str] = None,
             negative_prompt_embeds: Optional[torch.Tensor] = None,
-            negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
-            editing_prompt_embeds: Optional[torch.Tensor] = None,
             negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+            editing_prompt_embeds: Optional[torch.Tensor] = None,
             editing_prompt_attention_mask: Optional[torch.Tensor] = None,
     ):
         tokenizers = [self.tokenizer, self.tokenizer_2]
@@ -286,6 +467,8 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
 
         dtype = torch.float16 if self.device.type == "xla" else torch.float32
 
+        zero_out_negative_prompt = negative_prompt is None and self.config.force_zeros_for_empty_prompt
+
         if max_sequence_length is None:
             if text_encoder_index == 0:
                 max_length = 77
@@ -294,67 +477,66 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
         else:
             max_length = max_sequence_length
 
-        # if negative_prompt is not None and isinstance(negative_prompt, str):
-        #     batch_size = 1
-        # elif negative_prompt is not None and isinstance(negative_prompt, list):
-        #     batch_size = len(negative_prompt)
-        # else:
-        #     batch_size = negative_prompt_embeds.shape[0]
-        batch_size = 1  # todo
+        num_edit_tokens = 0
+        if editing_prompt is not None and isinstance(editing_prompt, str):
+            batch_size = 1
+        elif editing_prompt is not None and isinstance(editing_prompt, list):
+            batch_size = len(editing_prompt)
+        elif editing_prompt_embeds is not None:
+            batch_size = editing_prompt_embeds.shape[0]
+        elif negative_prompt_embeds is not None:
+            batch_size = negative_prompt_embeds.shape[0]
+        elif negative_prompt is None:
+            batch_size = 1
 
-        if editing_prompt is not None:
-            if isinstance(editing_prompt, str):
-                editing_prompt = [editing_prompt]
-            if isinstance(editing_prompt, list):
-                editing_prompt_embeds = []
-                editing_prompt_attention_masks = []
+        if enable_edit_guidance and editing_prompt_embeds is None:
+            text_inputs = tokenizer(
+                editing_prompt,
+                padding="max_length",
+                max_length=max_length,
+                truncation=True,
+                return_attention_mask=True,
+                return_tensors="pt",
+            )
+            text_input_ids = text_inputs.input_ids
+            untruncated_ids = tokenizer(editing_prompt, padding="longest", return_tensors="pt").input_ids
+            print("untruncated_ids.shape", untruncated_ids.shape)  # todo remove
+            print("editing prompt", editing_prompt)  # todo remove
+            num_edit_tokens = len(untruncated_ids) - 2  # todo check whether it is 2 for both tokenizer
 
-                for single_prompt in editing_prompt:
-                    single_prompt_input = tokenizer(
-                        single_prompt,
-                        padding="max_length",
-                        max_length=max_length,
-                        truncation=True,
-                        return_attention_mask=True,
-                        return_tensors="pt",
-                    )
-
-                    single_prompt_input_ids = single_prompt_input.input_ids
-                    single_prompt_attention_mask = single_prompt_input.attention_mask.to(device)
-
-                    single_prompt_embed = text_encoder(
-                        single_prompt_input_ids.to(device),
-                        attention_mask=single_prompt_attention_mask,
-                    )[0]
-
-                    editing_prompt_embeds.append(single_prompt_embed.to(dtype=dtype, device=device))
-                    editing_prompt_attention_masks.append(single_prompt_attention_mask)
-
-                # Convert lists to tensors
-                editing_prompt_embeds = torch.cat(editing_prompt_embeds)
-                editing_prompt_attention_mask = torch.cat(editing_prompt_attention_masks)
-            else:
-                raise ValueError(
-                    f"`editing_prompt` has to be of type `str` or `list` but is {type(editing_prompt)}"
+            if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+                text_input_ids, untruncated_ids
+            ):
+                removed_text = tokenizer.batch_decode(untruncated_ids[:, tokenizer.model_max_length - 1 : -1])
+                logger.warning(
+                    "The following part of your input was truncated because CLIP can only handle sequences up to"
+                    f" {tokenizer.model_max_length} tokens: {removed_text}"
                 )
 
-        else:
-            editing_prompt_embeds = None
-
-        if editing_prompt_embeds is not None:
-            editing_prompt_embeds = editing_prompt_embeds.repeat(1, num_images_per_prompt, 1)
-            editing_prompt_embeds = editing_prompt_embeds.view(batch_size * num_images_per_prompt, max_length, -1)
+            editing_prompt_attention_mask = text_inputs.attention_mask.to(device)
+            editing_prompt_embeds = text_encoder(
+                text_input_ids.to(device),
+                attention_mask=editing_prompt_attention_mask,
+            )
+            editing_prompt_embeds = editing_prompt_embeds[0]
+            editing_prompt_attention_mask = editing_prompt_attention_mask.repeat(num_images_per_prompt, 1)
 
         # get unconditional embeddings for classifier free guidance
-        if do_classifier_free_guidance and negative_prompt_embeds is None:
+        if negative_prompt_embeds is None:
             uncond_tokens: List[str]
             if negative_prompt is None:
                 uncond_tokens = [""] * batch_size
+            elif editing_prompt is not None and type(editing_prompt) is not type(negative_prompt):
+                raise TypeError(
+                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+                    f" {type(editing_prompt)}."
+                )
             elif isinstance(negative_prompt, str):
-                uncond_tokens = [negative_prompt, negative_prompt_2]
+                uncond_tokens = [negative_prompt]
             elif batch_size != len(negative_prompt):
                 raise ValueError(
                     f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+                    f" {editing_prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
                     " the batch size of `prompt`."
                 )
             else:
@@ -376,6 +558,17 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
             negative_prompt_embeds = negative_prompt_embeds[0]
             negative_prompt_attention_mask = negative_prompt_attention_mask.repeat(num_images_per_prompt, 1)
 
+            if zero_out_negative_prompt:
+                negative_prompt_embeds = torch.zeros_like(negative_prompt_embeds)
+
+        if editing_prompt_embeds is not None:
+            editing_prompt_embeds = editing_prompt_embeds.to(dtype=dtype, device=device)
+
+            bs_embed, seq_len, _ = editing_prompt_embeds.shape
+            # duplicate text embeddings for each generation per prompt, using mps friendly method
+            editing_prompt_embeds = editing_prompt_embeds.repeat(1, num_images_per_prompt, 1)
+            editing_prompt_embeds = editing_prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
         if do_classifier_free_guidance:
             # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
             seq_len = negative_prompt_embeds.shape[1]
@@ -383,9 +576,9 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
             negative_prompt_embeds = negative_prompt_embeds.to(dtype=dtype, device=device)
 
             negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
-            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, max_length, -1)
+            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
-        return negative_prompt_embeds, editing_prompt_embeds, negative_prompt_attention_mask, editing_prompt_attention_mask
+        return editing_prompt_embeds, negative_prompt_embeds, editing_prompt_attention_mask, negative_prompt_attention_mask, num_edit_tokens
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.run_safety_checker
     def run_safety_checker(self, image, device, dtype):
@@ -571,6 +764,7 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
             num_inference_steps: Optional[int] = 50,
             guidance_scale: Optional[float] = 5.0,
             negative_prompt: Optional[Union[str, List[str]]] = None,
+            negative_prompt_2: Optional[Union[str, List[str]]] = None,
             num_images_per_prompt: Optional[int] = 1,
             eta: Optional[float] = 0.0,
             generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -579,16 +773,10 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
             editing_prompt_embeds_2: Optional[torch.Tensor] = None,
             negative_prompt_embeds: Optional[torch.Tensor] = None,
             negative_prompt_embeds_2: Optional[torch.Tensor] = None,
-            # prompt_attention_mask: Optional[torch.Tensor] = None,
-            # prompt_attention_mask_2: Optional[torch.Tensor] = None,
             negative_prompt_attention_mask: Optional[torch.Tensor] = None,
             negative_prompt_attention_mask_2: Optional[torch.Tensor] = None,
             output_type: Optional[str] = "pil",
             return_dict: bool = True,
-            clip_skip: Optional[int] = None,
-            callback_on_step_end: Optional[
-                Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
-            ] = None,
             editing_prompt: Optional[Union[str, List[str]]] = None,
             editing_prompt_embeddings: Optional[torch.Tensor] = None,
             editing_pooled_prompt_embeds: Optional[torch.Tensor] = None,
@@ -597,15 +785,22 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
             edit_warmup_steps: Optional[Union[int, List[int]]] = 0,
             edit_cooldown_steps: Optional[Union[int, List[int]]] = None,
             edit_threshold: Optional[Union[float, List[float]]] = 0.9,
-            callback_on_step_end_tensor_inputs: List[str] = ["latents"],
             guidance_rescale: float = 0.0,
             original_size: Optional[Tuple[int, int]] = (1024, 1024),
             target_size: Optional[Tuple[int, int]] = None,
             crops_coords_top_left: Tuple[int, int] = (0, 0),
             use_resolution_binning: bool = True,
             sem_guidance: Optional[List[torch.Tensor]] = None,
+            use_cross_attn_mask: bool = False,
             use_intersect_mask: bool = False,
             user_mask: Optional[torch.Tensor] = None,
+            attn_store_steps: Optional[List[int]] = [],
+            store_averaged_over_steps: bool = True,
+            clip_skip: Optional[int] = None,
+            callback_on_step_end: Optional[
+                Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
+            ] = None,
+            callback_on_step_end_tensor_inputs: List[str] = ["latents"],
             **kwargs,
     ):
         r"""
@@ -724,13 +919,16 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
         self._guidance_rescale = guidance_rescale
         self._interrupt = False
 
+        latents = self.init_latents
+        zs = self.zs
+
         # 2. Define call parameters
-        # if prompt is not None and isinstance(prompt, str):
-        #     batch_size = 1
-        # elif prompt is not None and isinstance(prompt, list):
-        #     batch_size = len(prompt)
-        # else:
-        #     batch_size = prompt_embeds.shape[0]
+        if editing_prompt is not None and isinstance(editing_prompt, str):
+            batch_size = 1
+        elif editing_prompt is not None and isinstance(editing_prompt, list):
+            batch_size = len(editing_prompt)
+        else:
+            batch_size = 1
 
         device = self._execution_device
         if editing_prompt:
@@ -746,38 +944,29 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
             enable_edit_guidance = False
 
         # 3. Encode input prompt
-        (negative_prompt_embeds, editing_prompt_embeds,
-         negative_prompt_attention_mask, editing_prompt_attention_mask
-         ) = self.encode_prompt(
+        (editing_prompt_embeds, negative_prompt_embeds, editing_prompt_attention_mask,
+         negative_prompt_attention_mask, num_edit_tokens) = self.encode_prompt(
             editing_prompt=editing_prompt,
             device=device,
-            # self.transformer.dtype,
             num_images_per_prompt=num_images_per_prompt,
-            # do_classifier_free_guidance=do_classifier_free_guidance,
             negative_prompt=negative_prompt,
-            # prompt_embeds=prompt_embeds,
+            negative_prompt_2=negative_prompt_2,
             text_encoder_index=0,
             negative_prompt_embeds=negative_prompt_embeds,
-            # editing_prompt_embeds=editing_prompt_embeds,
-            # prompt_attention_mask=prompt_attention_mask,
+            enable_edit_guidance=enable_edit_guidance,
             negative_prompt_attention_mask=negative_prompt_attention_mask,
             editing_prompt_attention_mask=None,
             max_sequence_length=77,
         )
-        (negative_prompt_embeds_2, editing_prompt_embeds_2,
-         negative_prompt_attention_mask_2, editing_prompt_attention_mask_2
-         ) = self.encode_prompt(
+        (editing_prompt_embeds_2, negative_prompt_embeds_2, editing_prompt_attention_mask_2,
+         negative_prompt_attention_mask_2, num_edit_tokens) = self.encode_prompt(
             editing_prompt=editing_prompt,
             device=device,
-            # torch.float32,
             num_images_per_prompt=num_images_per_prompt,
             text_encoder_index=1,
-            # do_classifier_free_guidance=do_classifier_free_guidance,
             negative_prompt=negative_prompt,
-            # prompt_embeds=prompt_embeds_2,
+            negative_prompt_2=negative_prompt_2,
             negative_prompt_embeds=negative_prompt_embeds_2,
-            # editing_prompt_embeds=editing_prompt_embeds_2,
-            # prompt_attention_mask=prompt_attention_mask_2,
             negative_prompt_attention_mask=negative_prompt_attention_mask_2,
             editing_prompt_attention_mask=None,
             max_sequence_length=256,
@@ -787,14 +976,32 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
         t_to_idx = {int(v): k for k, v in enumerate(timesteps)}
+        if use_cross_attn_mask:
+            self.attention_store = LeditsAttentionStore(
+                average=store_averaged_over_steps,
+                batch_size=self.batch_size,
+                max_size=(latents.shape[-2] / 4.0) * (latents.shape[-1] / 4.0),
+                max_resolution=None,
+            )
+            # self.prepare_transformer(self.attention_store)
+            resolution = latents.shape[-2:]
+            att_res = (int(resolution[0] / 4), int(resolution[1] / 4))
 
         # 5. Prepare latent variables
         batch_size = 1  # added
         num_channels_latents = self.transformer.config.in_channels
-        latents = self.init_latents
-        zs = self.zs
+        latent = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            negative_prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
 
-        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        # 6. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         # 7 create image_rotary_emb, style embedding & time ids
@@ -862,7 +1069,7 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
                     continue
 
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                latent_model_input = torch.cat([latents] * (1 + enabled_editing_prompts)) if self.do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # expand scalar t to 1-D tensor to match the 1st dim of latent_model_input
@@ -895,7 +1102,7 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
 
                 # noise_pred, _ = noise_pred.chunk(2, dim=1)
 
-                noise_pred_out = noise_pred.chunk(1 + enabled_editing_prompts)  # [b,4, 64, 64]
+                noise_pred_out = noise_pred.chunk(1 + enabled_editing_prompts)
                 noise_pred_uncond = noise_pred_out[0]
                 noise_pred_edit_concepts = noise_pred_out[1:]
 
@@ -959,124 +1166,124 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
                         if user_mask is not None:
                             noise_guidance_edit_tmp = noise_guidance_edit_tmp * user_mask
 
-                        # if use_cross_attn_mask:
-                        #     out = self.attention_store.aggregate_attention(
-                        #         attention_maps=self.attention_store.step_store,
-                        #         prompts=self.text_cross_attention_maps,
-                        #         res=att_res,
-                        #         from_where=["up", "down"],
-                        #         is_cross=True,
-                        #         select=self.text_cross_attention_maps.index(editing_prompt[c]),
-                        #     )
-                        #     attn_map = out[:, :, :, 1 : 1 + num_edit_tokens[c]]  # 0 -> startoftext
-                        #
-                        #     # average over all tokens
-                        #     if attn_map.shape[3] != num_edit_tokens[c]:
-                        #         raise ValueError(
-                        #             f"Incorrect shape of attention_map. Expected size {num_edit_tokens[c]}, but found {attn_map.shape[3]}!"
-                        #         )
-                        #     attn_map = torch.sum(attn_map, dim=3)
-                        #
-                        #     # gaussian_smoothing
-                        #     attn_map = F.pad(attn_map.unsqueeze(1), (1, 1, 1, 1), mode="reflect")
-                        #     attn_map = self.smoothing(attn_map).squeeze(1)
-                        #
-                        #     # torch.quantile function expects float32
-                        #     if attn_map.dtype == torch.float32:
-                        #         tmp = torch.quantile(attn_map.flatten(start_dim=1), edit_threshold_c, dim=1)
-                        #     else:
-                        #         tmp = torch.quantile(
-                        #             attn_map.flatten(start_dim=1).to(torch.float32), edit_threshold_c, dim=1
-                        #         ).to(attn_map.dtype)
-                        #     attn_mask = torch.where(
-                        #         attn_map >= tmp.unsqueeze(1).unsqueeze(1).repeat(1, *att_res), 1.0, 0.0
-                        #     )
-                        #
-                        #     # resolution must match latent space dimension
-                        #     attn_mask = F.interpolate(
-                        #         attn_mask.unsqueeze(1),
-                        #         noise_guidance_edit_tmp.shape[-2:],  # 64,64
-                        #     ).repeat(1, 4, 1, 1)
-                        #     self.activation_mask[i, c] = attn_mask.detach().cpu()
-                        #     if not use_intersect_mask:
-                        #         noise_guidance_edit_tmp = noise_guidance_edit_tmp * attn_mask
-
-                        # if use_intersect_mask:
-                        #     noise_guidance_edit_tmp_quantile = torch.abs(noise_guidance_edit_tmp)
-                        #     noise_guidance_edit_tmp_quantile = torch.sum(
-                        #         noise_guidance_edit_tmp_quantile, dim=1, keepdim=True
-                        #     )
-                        #     noise_guidance_edit_tmp_quantile = noise_guidance_edit_tmp_quantile.repeat(
-                        #         1, self.unet.config.in_channels, 1, 1
-                        #     )
-                        #
-                        #     # torch.quantile function expects float32
-                        #     if noise_guidance_edit_tmp_quantile.dtype == torch.float32:
-                        #         tmp = torch.quantile(
-                        #             noise_guidance_edit_tmp_quantile.flatten(start_dim=2),
-                        #             edit_threshold_c,
-                        #             dim=2,
-                        #             keepdim=False,
-                        #         )
-                        #     else:
-                        #         tmp = torch.quantile(
-                        #             noise_guidance_edit_tmp_quantile.flatten(start_dim=2).to(torch.float32),
-                        #             edit_threshold_c,
-                        #             dim=2,
-                        #             keepdim=False,
-                        #         ).to(noise_guidance_edit_tmp_quantile.dtype)
-                        #
-                        #     intersect_mask = (
-                        #         torch.where(
-                        #             noise_guidance_edit_tmp_quantile >= tmp[:, :, None, None],
-                        #             torch.ones_like(noise_guidance_edit_tmp),
-                        #             torch.zeros_like(noise_guidance_edit_tmp),
-                        #         )
-                        #         * attn_mask
-                        #     )
-                        #
-                        #     self.activation_mask[i, c] = intersect_mask.detach().cpu()
-                        #
-                        #     noise_guidance_edit_tmp = noise_guidance_edit_tmp * intersect_mask
-
-                        # elif not use_cross_attn_mask: # todo
-                        # calculate quantile
-                        noise_guidance_edit_tmp_quantile = torch.abs(noise_guidance_edit_tmp)
-                        noise_guidance_edit_tmp_quantile = torch.sum(
-                            noise_guidance_edit_tmp_quantile, dim=1, keepdim=True
-                        )
-
-                        noise_guidance_edit_tmp_quantile = noise_guidance_edit_tmp_quantile.repeat(1, 8, 1, 1)
-
-                        # torch.quantile function expects float32
-                        if noise_guidance_edit_tmp_quantile.dtype == torch.float32:
-                            tmp = torch.quantile(
-                                noise_guidance_edit_tmp_quantile.flatten(start_dim=2),
-                                edit_threshold_c,
-                                dim=2,
-                                keepdim=False,
+                        if use_cross_attn_mask:
+                            out = self.attention_store.aggregate_attention(
+                                attention_maps=self.attention_store.step_store,
+                                prompts=self.text_cross_attention_maps,
+                                res=att_res,
+                                from_where=["up", "down"],
+                                is_cross=True,
+                                select=self.text_cross_attention_maps.index(editing_prompt[c]),
                             )
-                        else:
-                            tmp = torch.quantile(
-                                noise_guidance_edit_tmp_quantile.flatten(start_dim=2).to(torch.float32),
-                                edit_threshold_c,
-                                dim=2,
-                                keepdim=False,
-                            ).to(noise_guidance_edit_tmp_quantile.dtype)
+                            attn_map = out[:, :, :, 1: 1 + num_edit_tokens[c]]  # 0 -> startoftext
 
-                        # self.activation_mask[i, c] = (
-                        #     torch.where(
-                        #         noise_guidance_edit_tmp_quantile >= tmp[:, :, None, None],
-                        #         torch.ones_like(noise_guidance_edit_tmp),
-                        #         torch.zeros_like(noise_guidance_edit_tmp),
-                        #     ).detach().cpu()
-                        # )
+                            # average over all tokens
+                            if attn_map.shape[3] != num_edit_tokens[c]:
+                                raise ValueError(
+                                    f"Incorrect shape of attention_map. Expected size {num_edit_tokens[c]}, but found {attn_map.shape[3]}!"
+                                )
+                            attn_map = torch.sum(attn_map, dim=3)
 
-                        noise_guidance_edit_tmp = torch.where(
-                            noise_guidance_edit_tmp_quantile >= tmp[:, :, None, None],
-                            noise_guidance_edit_tmp,
-                            torch.zeros_like(noise_guidance_edit_tmp),
-                        )
+                            # gaussian_smoothing
+                            attn_map = F.pad(attn_map.unsqueeze(1), (1, 1, 1, 1), mode="reflect")
+                            attn_map = self.smoothing(attn_map).squeeze(1)
+
+                            # torch.quantile function expects float32
+                            if attn_map.dtype == torch.float32:
+                                tmp = torch.quantile(attn_map.flatten(start_dim=1), edit_threshold_c, dim=1)
+                            else:
+                                tmp = torch.quantile(
+                                    attn_map.flatten(start_dim=1).to(torch.float32), edit_threshold_c, dim=1
+                                ).to(attn_map.dtype)
+                            attn_mask = torch.where(
+                                attn_map >= tmp.unsqueeze(1).unsqueeze(1).repeat(1, *att_res), 1.0, 0.0
+                            )
+
+                            # resolution must match latent space dimension
+                            attn_mask = F.interpolate(
+                                attn_mask.unsqueeze(1),
+                                noise_guidance_edit_tmp.shape[-2:],
+                            ).repeat(1, 4, 1, 1)
+                            self.activation_mask[i, c] = attn_mask.detach().cpu()
+                            if not use_intersect_mask:
+                                noise_guidance_edit_tmp = noise_guidance_edit_tmp * attn_mask
+
+                        if use_intersect_mask:
+                            noise_guidance_edit_tmp_quantile = torch.abs(noise_guidance_edit_tmp)
+                            noise_guidance_edit_tmp_quantile = torch.sum(
+                                noise_guidance_edit_tmp_quantile, dim=1, keepdim=True
+                            )
+                            noise_guidance_edit_tmp_quantile = noise_guidance_edit_tmp_quantile.repeat(
+                                1, self.transformer.config.in_channels, 1, 1
+                            )
+
+                            # torch.quantile function expects float32
+                            if noise_guidance_edit_tmp_quantile.dtype == torch.float32:
+                                tmp = torch.quantile(
+                                    noise_guidance_edit_tmp_quantile.flatten(start_dim=2),
+                                    edit_threshold_c,
+                                    dim=2,
+                                    keepdim=False,
+                                )
+                            else:
+                                tmp = torch.quantile(
+                                    noise_guidance_edit_tmp_quantile.flatten(start_dim=2).to(torch.float32),
+                                    edit_threshold_c,
+                                    dim=2,
+                                    keepdim=False,
+                                ).to(noise_guidance_edit_tmp_quantile.dtype)
+
+                            intersect_mask = (
+                                torch.where(
+                                    noise_guidance_edit_tmp_quantile >= tmp[:, :, None, None],
+                                    torch.ones_like(noise_guidance_edit_tmp),
+                                    torch.zeros_like(noise_guidance_edit_tmp),
+                                )
+                                * attn_mask
+                            )
+
+                            self.activation_mask[i, c] = intersect_mask.detach().cpu()
+
+                            noise_guidance_edit_tmp = noise_guidance_edit_tmp * intersect_mask
+
+                        elif not use_cross_attn_mask:  # todo
+                            # calculate quantile
+                            noise_guidance_edit_tmp_quantile = torch.abs(noise_guidance_edit_tmp)
+                            noise_guidance_edit_tmp_quantile = torch.sum(
+                                noise_guidance_edit_tmp_quantile, dim=1, keepdim=True
+                            )
+
+                            noise_guidance_edit_tmp_quantile = noise_guidance_edit_tmp_quantile.repeat(1, 4, 1, 1)
+
+                            # torch.quantile function expects float32
+                            if noise_guidance_edit_tmp_quantile.dtype == torch.float32:
+                                tmp = torch.quantile(
+                                    noise_guidance_edit_tmp_quantile.flatten(start_dim=2),
+                                    edit_threshold_c,
+                                    dim=2,
+                                    keepdim=False,
+                                )
+                            else:
+                                tmp = torch.quantile(
+                                    noise_guidance_edit_tmp_quantile.flatten(start_dim=2).to(torch.float32),
+                                    edit_threshold_c,
+                                    dim=2,
+                                    keepdim=False,
+                                ).to(noise_guidance_edit_tmp_quantile.dtype)
+
+                            # self.activation_mask[i, c] = (
+                            #     torch.where(
+                            #         noise_guidance_edit_tmp_quantile >= tmp[:, :, None, None],
+                            #         torch.ones_like(noise_guidance_edit_tmp),
+                            #         torch.zeros_like(noise_guidance_edit_tmp),
+                            #     ).detach().cpu()
+                            # )
+
+                            noise_guidance_edit_tmp = torch.where(
+                                noise_guidance_edit_tmp_quantile >= tmp[:, :, None, None],
+                                noise_guidance_edit_tmp,
+                                torch.zeros_like(noise_guidance_edit_tmp),
+                            )
                         # elif until here
 
                         noise_guidance_edit += noise_guidance_edit_tmp
@@ -1096,13 +1303,10 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
                     )
 
                 idx = t_to_idx[int(t)]
-                noise_pred = noise_pred[:, :4]
+                noise_pred = noise_pred[:, :4]  # todo fix noise pred shape get [1, 8, 128, 128] instead of [1, 4, 128, 128]
                 latents = self.scheduler.step(
                     noise_pred, t, latents, variance_noise=zs[idx], **extra_step_kwargs, return_dict=False
                 )[0]
-
-                # compute the previous noisy sample x_t -> x_t-1
-                # latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -1187,9 +1391,11 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
             num_inversion_steps: int = 50,
             skip: float = 0.15,
             generator: Optional[torch.Generator] = None,
-            crops_coords_top_left: Tuple[int, int] = (0, 0),
             num_zero_noise_steps: int = 3,
             cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+            original_size: Optional[Tuple[int, int]] = (1024, 1024),
+            target_size: Optional[Tuple[int, int]] = None,
+            crops_coords_top_left: Tuple[int, int] = (0, 0),
     ):
         r"""
         The function to the pipeline for image inversion as described by the [LEDITS++
@@ -1264,9 +1470,9 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
         self.batch_size = x0.shape[0]
 
         # 2. get embeddings
-        text_encoder_lora_scale = (
-            cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
-        )
+        # text_encoder_lora_scale = (
+        #     cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
+        # )
 
         if isinstance(source_prompt, str):
             source_prompt = [source_prompt] * batch_size
@@ -1274,8 +1480,9 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
         (
             negative_prompt_embeds,
             prompt_embeds,
-            negative_prompt_attention_mask,
+            negative_pooled_prompt_embeds,
             prompt_attention_mask,
+            num_edit_tokens
         ) = self.encode_prompt(
             editing_prompt=source_prompt,
             device=device,
@@ -1292,8 +1499,9 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
         (
             negative_prompt_embeds_2,
             prompt_embeds_2,
-            negative_prompt_attention_mask_2,
+            negative_pooled_prompt_embeds_2,
             prompt_attention_mask_2,
+            num_edit_tokens
         ) = self.encode_prompt(
             editing_prompt=source_prompt,
             device=device,
@@ -1301,7 +1509,7 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
             text_encoder_index=1,
             do_classifier_free_guidance=do_classifier_free_guidance,
             negative_prompt=negative_prompt_2,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            negative_prompt_attention_mask=negative_pooled_prompt_embeds,
             editing_prompt_attention_mask=None,
             max_sequence_length=256,
         )
@@ -1311,23 +1519,20 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
         if negative_prompt_embeds_2 is None:
             negative_prompt_embeds_2 = torch.zeros_like(prompt_embeds_2)
 
-        if self.text_encoder_2 is None:
-            text_encoder_projection_dim = int(negative_prompt_embeds.shape[-1])
-        else:
-            text_encoder_projection_dim = self.text_encoder_2.config.d_model
+        # if self.text_encoder_2 is None:
+        #     text_encoder_projection_dim = int(negative_prompt_embeds.shape[-1])
+        # else:
+        #     text_encoder_projection_dim = self.text_encoder_2.config.d_model
 
         # 3. Prepare added time ids & embeddings
         add_text_embeds = negative_prompt_embeds.mean(dim=1)  # todo check
-        add_time_ids = self._get_add_time_ids(
-            self.size,
-            crops_coords_top_left,
-            self.size,
-            dtype=negative_prompt_embeds.dtype,
-            text_encoder_projection_dim=text_encoder_projection_dim,
-        )
+        target_size = target_size or (height, width)
+        add_time_ids = list(original_size + target_size + crops_coords_top_left)
+        add_time_ids = torch.tensor([add_time_ids], dtype=prompt_embeds.dtype)
 
         if do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            prompt_embeds_2 = torch.cat([negative_prompt_embeds_2, prompt_embeds_2], dim=0)
             add_text_embeds = torch.cat([add_text_embeds, add_text_embeds], dim=0)
             add_time_ids = torch.cat([add_time_ids] * 2, dim=0)
 
@@ -1394,6 +1599,15 @@ class LEditsPPPipelineHunyuan(DiffusionPipeline):
             t_expand = torch.tensor([t] * latent_model_input.shape[0], device=device).to(
                 dtype=latent_model_input.dtype
             )
+
+            # TODO remove
+            # print("latent_model_input.shape", latent_model_input.shape)
+            # print("t_expand.shape", t_expand.shape)
+            # print("prompt_embeds.shape", prompt_embeds.shape)
+            # print("prompt_attention_mask.shape", prompt_attention_mask.shape)
+            # print("prompt_embeds_2.shape", prompt_embeds_2.shape)
+            # print("prompt_attention_mask_2.shape", prompt_attention_mask_2.shape)
+            # print("add_time_ids.shape", add_time_ids.shape)
 
             noise_pred = self.transformer(
                 latent_model_input,
