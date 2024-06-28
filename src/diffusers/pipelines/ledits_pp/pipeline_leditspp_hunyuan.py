@@ -1087,6 +1087,8 @@ class LEditsPPPipelineHunyuan(
                 # print("style.shape", style.shape)
 
                 # predict the noise residual
+                # if ip_adapter_image is not None:
+                #     added_cond_kwargs["image_embeds"] = image_embeds
                 noise_pred = self.transformer(
                     latent_model_input,
                     t_expand,
@@ -1099,8 +1101,6 @@ class LEditsPPPipelineHunyuan(
                     image_rotary_emb=image_rotary_emb,
                     return_dict=False,
                 )[0]
-
-                # noise_pred, _ = noise_pred.chunk(2, dim=1)
 
                 noise_pred_out = noise_pred.chunk(1 + enabled_editing_prompts)
                 noise_pred_uncond = noise_pred_out[0]
@@ -1203,7 +1203,7 @@ class LEditsPPPipelineHunyuan(
                             attn_mask = F.interpolate(
                                 attn_mask.unsqueeze(1),
                                 noise_guidance_edit_tmp.shape[-2:],
-                            ).repeat(1, 4, 1, 1)
+                            ).repeat(1, 8, 1, 1)
                             self.activation_mask[i, c] = attn_mask.detach().cpu()
                             if not use_intersect_mask:
                                 noise_guidance_edit_tmp = noise_guidance_edit_tmp * attn_mask
@@ -1246,14 +1246,14 @@ class LEditsPPPipelineHunyuan(
 
                             noise_guidance_edit_tmp = noise_guidance_edit_tmp * intersect_mask
 
-                        elif not use_cross_attn_mask:  # todo
+                        elif not use_cross_attn_mask:
                             # calculate quantile
                             noise_guidance_edit_tmp_quantile = torch.abs(noise_guidance_edit_tmp)
                             noise_guidance_edit_tmp_quantile = torch.sum(
                                 noise_guidance_edit_tmp_quantile, dim=1, keepdim=True
                             )
 
-                            noise_guidance_edit_tmp_quantile = noise_guidance_edit_tmp_quantile.repeat(1, 4, 1, 1)
+                            noise_guidance_edit_tmp_quantile = noise_guidance_edit_tmp_quantile.repeat(1, 8, 1, 1)
 
                             # torch.quantile function expects float32
                             if noise_guidance_edit_tmp_quantile.dtype == torch.float32:
@@ -1271,13 +1271,17 @@ class LEditsPPPipelineHunyuan(
                                     keepdim=False,
                                 ).to(noise_guidance_edit_tmp_quantile.dtype)
 
-                            # self.activation_mask[i, c] = (
-                            #     torch.where(
-                            #         noise_guidance_edit_tmp_quantile >= tmp[:, :, None, None],
-                            #         torch.ones_like(noise_guidance_edit_tmp),
-                            #         torch.zeros_like(noise_guidance_edit_tmp),
-                            #     ).detach().cpu()
-                            # )
+                            self.activation_mask[i, c] = (
+                                torch.where(
+                                    noise_guidance_edit_tmp_quantile >= tmp[:, :, None, None],
+                                    torch.ones_like(noise_guidance_edit_tmp),
+                                    torch.zeros_like(noise_guidance_edit_tmp),
+                                ).detach().cpu()
+                            )
+
+                            print("noise_guidance_edit_tmp_quantile.shape", noise_guidance_edit_tmp_quantile.shape)
+                            print("tmp.shape", tmp.shape)
+                            print("noise_guidance_edit_tmp.shape", noise_guidance_edit_tmp.shape)
 
                             noise_guidance_edit_tmp = torch.where(
                                 noise_guidance_edit_tmp_quantile >= tmp[:, :, None, None],
@@ -1294,7 +1298,7 @@ class LEditsPPPipelineHunyuan(
 
                 # perform guidance
 
-                if self.do_classifier_free_guidance and guidance_rescale > 0.0:
+                if enable_edit_guidance and guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
                     noise_pred = rescale_noise_cfg(
                         noise_pred,
@@ -1478,15 +1482,14 @@ class LEditsPPPipelineHunyuan(
             source_prompt = [source_prompt] * batch_size
 
         (
-            negative_prompt_embeds,
             prompt_embeds,
-            negative_pooled_prompt_embeds,
+            negative_prompt_embeds,
             prompt_attention_mask,
-            num_edit_tokens
+            negative_prompt_attention_mask,
+            _
         ) = self.encode_prompt(
             editing_prompt=source_prompt,
             device=device,
-            # self.transformer.dtype,
             num_images_per_prompt=num_images_per_prompt,
             text_encoder_index=0,
             do_classifier_free_guidance=do_classifier_free_guidance,
@@ -1497,11 +1500,11 @@ class LEditsPPPipelineHunyuan(
         )
 
         (
-            negative_prompt_embeds_2,
             prompt_embeds_2,
-            negative_pooled_prompt_embeds_2,
+            negative_prompt_embeds_2,
             prompt_attention_mask_2,
-            num_edit_tokens
+            negative_prompt_attention_mask_2,
+            _
         ) = self.encode_prompt(
             editing_prompt=source_prompt,
             device=device,
@@ -1509,7 +1512,7 @@ class LEditsPPPipelineHunyuan(
             text_encoder_index=1,
             do_classifier_free_guidance=do_classifier_free_guidance,
             negative_prompt=negative_prompt_2,
-            negative_prompt_attention_mask=negative_pooled_prompt_embeds,
+            negative_prompt_attention_mask=None,
             editing_prompt_attention_mask=None,
             max_sequence_length=256,
         )
@@ -1519,13 +1522,7 @@ class LEditsPPPipelineHunyuan(
         if negative_prompt_embeds_2 is None:
             negative_prompt_embeds_2 = torch.zeros_like(prompt_embeds_2)
 
-        # if self.text_encoder_2 is None:
-        #     text_encoder_projection_dim = int(negative_prompt_embeds.shape[-1])
-        # else:
-        #     text_encoder_projection_dim = self.text_encoder_2.config.d_model
-
         # 3. Prepare added time ids & embeddings
-        add_text_embeds = negative_prompt_embeds.mean(dim=1)  # todo check
         target_size = target_size or (height, width)
         add_time_ids = list(original_size + target_size + crops_coords_top_left)
         add_time_ids = torch.tensor([add_time_ids], dtype=prompt_embeds.dtype)
@@ -1533,11 +1530,9 @@ class LEditsPPPipelineHunyuan(
         if do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             prompt_embeds_2 = torch.cat([negative_prompt_embeds_2, prompt_embeds_2], dim=0)
-            add_text_embeds = torch.cat([add_text_embeds, add_text_embeds], dim=0)
             add_time_ids = torch.cat([add_time_ids] * 2, dim=0)
 
         prompt_embeds = prompt_embeds.to(device)
-        add_text_embeds = add_text_embeds.to(device)
         add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
 
         # autoencoder reconstruction
@@ -1600,15 +1595,6 @@ class LEditsPPPipelineHunyuan(
                 dtype=latent_model_input.dtype
             )
 
-            # TODO remove
-            # print("latent_model_input.shape", latent_model_input.shape)
-            # print("t_expand.shape", t_expand.shape)
-            # print("prompt_embeds.shape", prompt_embeds.shape)
-            # print("prompt_attention_mask.shape", prompt_attention_mask.shape)
-            # print("prompt_embeds_2.shape", prompt_embeds_2.shape)
-            # print("prompt_attention_mask_2.shape", prompt_attention_mask_2.shape)
-            # print("add_time_ids.shape", add_time_ids.shape)
-
             noise_pred = self.transformer(
                 latent_model_input,
                 t_expand,
@@ -1629,7 +1615,13 @@ class LEditsPPPipelineHunyuan(
                 noise_pred = noise_pred_uncond + source_guidance_scale * (noise_pred_text - noise_pred_uncond)
 
             xtm1 = xts[idx]
-            noise_pred = noise_pred[:, :4, ]
+            # print("noise_pred.shape", noise_pred.shape)
+            # print("xtm1.shape", xtm1.shape)
+            # print("xt.shape", xt.shape)
+            # print("t.shape", t.shape)
+            # print("zs[idx].shape", zs[idx].shape)
+            # print("self.eta", self.eta)
+            noise_pred = noise_pred[:, :4, ]  # todo fix noise pred shape get [1, 8, 128, 128] instead of [1, 4, 128, 128]
             z, xtm1_corrected = compute_noise(self.scheduler, xtm1, xt, t, noise_pred, self.eta)
             zs[idx] = z
 
