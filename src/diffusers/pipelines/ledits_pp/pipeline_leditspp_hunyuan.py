@@ -450,10 +450,8 @@ class LEditsPPPipelineHunyuan(
             text_encoder_index: int = 0,
             max_sequence_length: Optional[int] = None,
             do_classifier_free_guidance: bool = True,
-            clip_skip: Optional[int] = None,
             enable_edit_guidance: bool = True,
             negative_prompt: Optional[torch.Tensor] = None,
-            negative_prompt_2: Optional[str] = None,
             negative_prompt_embeds: Optional[torch.Tensor] = None,
             negative_prompt_attention_mask: Optional[torch.Tensor] = None,
             editing_prompt_embeds: Optional[torch.Tensor] = None,
@@ -486,7 +484,9 @@ class LEditsPPPipelineHunyuan(
             batch_size = editing_prompt_embeds.shape[0]
         elif negative_prompt_embeds is not None:
             batch_size = negative_prompt_embeds.shape[0]
-        elif negative_prompt is None:
+        elif negative_prompt is None or isinstance(negative_prompt, str):
+            batch_size = 1
+        else:
             batch_size = 1
 
         if enable_edit_guidance and editing_prompt_embeds is None:
@@ -500,9 +500,7 @@ class LEditsPPPipelineHunyuan(
             )
             text_input_ids = text_inputs.input_ids
             untruncated_ids = tokenizer(editing_prompt, padding="longest", return_tensors="pt").input_ids
-            print("untruncated_ids.shape", untruncated_ids.shape)  # todo remove
-            print("editing prompt", editing_prompt)  # todo remove
-            num_edit_tokens = len(untruncated_ids) - 2  # todo check whether it is 2 for both tokenizer
+            num_edit_tokens = len(untruncated_ids) - 2
 
             if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
                 text_input_ids, untruncated_ids
@@ -559,7 +557,7 @@ class LEditsPPPipelineHunyuan(
             negative_prompt_attention_mask = negative_prompt_attention_mask.repeat(num_images_per_prompt, 1)
 
             if zero_out_negative_prompt:
-                negative_prompt_embeds = torch.zeros_like(negative_prompt_embeds)
+                negative_prompt_embeds = torch.zeros_like(negative_prompt_embeds, device=device)
 
         if editing_prompt_embeds is not None:
             editing_prompt_embeds = editing_prompt_embeds.to(dtype=dtype, device=device)
@@ -758,7 +756,6 @@ class LEditsPPPipelineHunyuan(
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
             self,
-            # prompt: Union[str, List[str]] = None,
             height: Optional[int] = None,
             width: Optional[int] = None,
             num_inference_steps: Optional[int] = 50,
@@ -778,8 +775,6 @@ class LEditsPPPipelineHunyuan(
             output_type: Optional[str] = "pil",
             return_dict: bool = True,
             editing_prompt: Optional[Union[str, List[str]]] = None,
-            editing_prompt_embeddings: Optional[torch.Tensor] = None,
-            editing_pooled_prompt_embeds: Optional[torch.Tensor] = None,
             reverse_editing_direction: Optional[Union[bool, List[bool]]] = False,
             edit_guidance_scale: Optional[Union[float, List[float]]] = 5,
             edit_warmup_steps: Optional[Union[int, List[int]]] = 0,
@@ -931,6 +926,7 @@ class LEditsPPPipelineHunyuan(
             batch_size = 1
 
         device = self._execution_device
+
         if editing_prompt:
             enable_edit_guidance = True
             if isinstance(editing_prompt, str):
@@ -950,7 +946,7 @@ class LEditsPPPipelineHunyuan(
             device=device,
             num_images_per_prompt=num_images_per_prompt,
             negative_prompt=negative_prompt,
-            negative_prompt_2=negative_prompt_2,
+            # negative_prompt_2=negative_prompt_2,
             text_encoder_index=0,
             negative_prompt_embeds=negative_prompt_embeds,
             enable_edit_guidance=enable_edit_guidance,
@@ -965,8 +961,9 @@ class LEditsPPPipelineHunyuan(
             num_images_per_prompt=num_images_per_prompt,
             text_encoder_index=1,
             negative_prompt=negative_prompt,
-            negative_prompt_2=negative_prompt_2,
+            # negative_prompt_2=negative_prompt_2,
             negative_prompt_embeds=negative_prompt_embeds_2,
+            enable_edit_guidance=enable_edit_guidance,
             negative_prompt_attention_mask=negative_prompt_attention_mask_2,
             editing_prompt_attention_mask=None,
             max_sequence_length=256,
@@ -1046,8 +1043,6 @@ class LEditsPPPipelineHunyuan(
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask])
             prompt_embeds_2 = torch.cat([negative_prompt_embeds_2])
             prompt_attention_mask_2 = torch.cat([negative_prompt_attention_mask_2])
-            add_time_ids = torch.cat([add_time_ids] * 2, dim=0)
-            style = torch.cat([style] * 2, dim=0)
 
         prompt_embeds = prompt_embeds.to(device=device)
         prompt_attention_mask = prompt_attention_mask.to(device=device)
@@ -1077,15 +1072,6 @@ class LEditsPPPipelineHunyuan(
                     dtype=latent_model_input.dtype
                 )
 
-                # print("latent_model_input.shape", latent_model_input.shape)
-                # print("t_expand.shape", t_expand.shape)
-                # print("editing_prompt_embeds.shape", editing_prompt_embeds.shape)
-                # print("editing_prompt_attention_mask.shape", editing_prompt_attention_mask.shape)
-                # print("editing_prompt_embeds_2.shape", editing_prompt_embeds_2.shape)
-                # print("editing_prompt_attention_mask_2.shape", editing_prompt_attention_mask_2.shape)
-                # print("add_time_ids.shape", add_time_ids.shape)
-                # print("style.shape", style.shape)
-
                 # predict the noise residual
                 # if ip_adapter_image is not None:
                 #     added_cond_kwargs["image_embeds"] = image_embeds
@@ -1101,11 +1087,11 @@ class LEditsPPPipelineHunyuan(
                     image_rotary_emb=image_rotary_emb,
                     return_dict=False,
                 )[0]
+                noise_pred, _ = noise_pred.chunk(2, dim=1)
 
                 noise_pred_out = noise_pred.chunk(1 + enabled_editing_prompts)
                 noise_pred_uncond = noise_pred_out[0]
                 noise_pred_edit_concepts = noise_pred_out[1:]
-
                 noise_guidance_edit = torch.zeros(
                     noise_pred_uncond.shape,
                     device=self.device,
@@ -1166,7 +1152,7 @@ class LEditsPPPipelineHunyuan(
                         if user_mask is not None:
                             noise_guidance_edit_tmp = noise_guidance_edit_tmp * user_mask
 
-                        if use_cross_attn_mask:
+                        if use_cross_attn_mask:  # todo
                             out = self.attention_store.aggregate_attention(
                                 attention_maps=self.attention_store.step_store,
                                 prompts=self.text_cross_attention_maps,
@@ -1253,7 +1239,7 @@ class LEditsPPPipelineHunyuan(
                                 noise_guidance_edit_tmp_quantile, dim=1, keepdim=True
                             )
 
-                            noise_guidance_edit_tmp_quantile = noise_guidance_edit_tmp_quantile.repeat(1, 8, 1, 1)
+                            noise_guidance_edit_tmp_quantile = noise_guidance_edit_tmp_quantile.repeat(1, 4, 1, 1)
 
                             # torch.quantile function expects float32
                             if noise_guidance_edit_tmp_quantile.dtype == torch.float32:
@@ -1279,16 +1265,11 @@ class LEditsPPPipelineHunyuan(
                                 ).detach().cpu()
                             )
 
-                            print("noise_guidance_edit_tmp_quantile.shape", noise_guidance_edit_tmp_quantile.shape)
-                            print("tmp.shape", tmp.shape)
-                            print("noise_guidance_edit_tmp.shape", noise_guidance_edit_tmp.shape)
-
                             noise_guidance_edit_tmp = torch.where(
                                 noise_guidance_edit_tmp_quantile >= tmp[:, :, None, None],
                                 noise_guidance_edit_tmp,
                                 torch.zeros_like(noise_guidance_edit_tmp),
                             )
-                        # elif until here
 
                         noise_guidance_edit += noise_guidance_edit_tmp
 
@@ -1296,21 +1277,23 @@ class LEditsPPPipelineHunyuan(
 
                 noise_pred = noise_pred_uncond + noise_guidance_edit
 
-                # perform guidance
-
+                # compute the previous noisy sample x_t -> x_t-1
                 if enable_edit_guidance and guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
                     noise_pred = rescale_noise_cfg(
                         noise_pred,
-                        noise_pred_edit_concepts.mean(dim=0, keepdim=False),
+                        noise_pred_edit_concepts.mean(dim=0, keepdim=False),  # todo
                         guidance_rescale=guidance_rescale
                     )
 
                 idx = t_to_idx[int(t)]
-                noise_pred = noise_pred[:, :4]  # todo fix noise pred shape get [1, 8, 128, 128] instead of [1, 4, 128, 128]
                 latents = self.scheduler.step(
                     noise_pred, t, latents, variance_noise=zs[idx], **extra_step_kwargs, return_dict=False
                 )[0]
+
+                if use_cross_attn_mask:
+                    store_step = i in attn_store_steps
+                    self.attention_store.between_steps(store_step)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -1448,7 +1431,6 @@ class LEditsPPPipelineHunyuan(
             and respective VAE reconstruction(s).
         """
         device = self._execution_device
-        batch_size = 1
         num_images_per_prompt = 1
 
         self.eta = 1.0
@@ -1479,7 +1461,7 @@ class LEditsPPPipelineHunyuan(
         # )
 
         if isinstance(source_prompt, str):
-            source_prompt = [source_prompt] * batch_size
+            source_prompt = [source_prompt] * self.batch_size
 
         (
             prompt_embeds,
@@ -1494,6 +1476,7 @@ class LEditsPPPipelineHunyuan(
             text_encoder_index=0,
             do_classifier_free_guidance=do_classifier_free_guidance,
             negative_prompt=negative_prompt,
+            negative_prompt_2=negative_prompt_2,
             negative_prompt_attention_mask=None,
             editing_prompt_attention_mask=None,
             max_sequence_length=77,
@@ -1511,16 +1494,12 @@ class LEditsPPPipelineHunyuan(
             num_images_per_prompt=num_images_per_prompt,
             text_encoder_index=1,
             do_classifier_free_guidance=do_classifier_free_guidance,
-            negative_prompt=negative_prompt_2,
+            negative_prompt=negative_prompt,
+            negative_prompt_2=negative_prompt_2,
             negative_prompt_attention_mask=None,
             editing_prompt_attention_mask=None,
             max_sequence_length=256,
         )
-
-        if negative_prompt_embeds is None:
-            negative_prompt_embeds = torch.zeros_like(prompt_embeds)
-        if negative_prompt_embeds_2 is None:
-            negative_prompt_embeds_2 = torch.zeros_like(prompt_embeds_2)
 
         # 3. Prepare added time ids & embeddings
         target_size = target_size or (height, width)
@@ -1528,12 +1507,13 @@ class LEditsPPPipelineHunyuan(
         add_time_ids = torch.tensor([add_time_ids], dtype=prompt_embeds.dtype)
 
         if do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            prompt_embeds_2 = torch.cat([negative_prompt_embeds_2, prompt_embeds_2], dim=0)
+            negative_prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            negative_prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
+            negative_prompt_embeds_2 = torch.cat([negative_prompt_embeds_2, prompt_embeds_2], dim=0)
+            negative_prompt_attention_mask_2 = torch.cat([negative_prompt_attention_mask_2, prompt_attention_mask_2], dim=0)
             add_time_ids = torch.cat([add_time_ids] * 2, dim=0)
 
-        prompt_embeds = prompt_embeds.to(device)
-        add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
+        add_time_ids = add_time_ids.to(device).repeat(self.batch_size * num_images_per_prompt, 1)
 
         # autoencoder reconstruction
         if self.vae.dtype == torch.float16 and self.vae.config.force_upcast:
@@ -1557,7 +1537,7 @@ class LEditsPPPipelineHunyuan(
 
         # intermediate latents
         t_to_idx = {int(v): k for k, v in enumerate(timesteps)}
-        xts = torch.zeros(size=variance_noise_shape, device=self.device, dtype=prompt_embeds.dtype)
+        xts = torch.zeros(size=variance_noise_shape, device=self.device, dtype=negative_prompt_embeds.dtype)
 
         for t in reversed(timesteps):
             idx = num_inversion_steps - t_to_idx[int(t)] - 1
@@ -1566,11 +1546,11 @@ class LEditsPPPipelineHunyuan(
         xts = torch.cat([x0.unsqueeze(0), xts], dim=0)
 
         # noise maps
-        zs = torch.zeros(size=variance_noise_shape, device=self.device, dtype=prompt_embeds.dtype)
+        zs = torch.zeros(size=variance_noise_shape, device=self.device, dtype=negative_prompt_embeds.dtype)
 
         self.scheduler.set_timesteps(len(self.scheduler.timesteps))
 
-        style = torch.tensor([0], device=device).repeat(batch_size * num_images_per_prompt)
+        style = torch.tensor([0], device=device).repeat(self.batch_size * num_images_per_prompt)
 
         grid_height = height // 8 // self.transformer.config.patch_size
         grid_width = width // 8 // self.transformer.config.patch_size
@@ -1598,30 +1578,24 @@ class LEditsPPPipelineHunyuan(
             noise_pred = self.transformer(
                 latent_model_input,
                 t_expand,
-                encoder_hidden_states=prompt_embeds,
-                text_embedding_mask=prompt_attention_mask,
-                encoder_hidden_states_t5=prompt_embeds_2,
-                text_embedding_mask_t5=prompt_attention_mask_2,
+                encoder_hidden_states=negative_prompt_embeds,
+                text_embedding_mask=negative_prompt_attention_mask,
+                encoder_hidden_states_t5=negative_prompt_embeds_2,
+                text_embedding_mask_t5=negative_prompt_attention_mask_2,
                 image_meta_size=add_time_ids,
                 style=style,
                 image_rotary_emb=image_rotary_emb,
                 return_dict=False,
             )[0]
 
+            noise_pred, _ = noise_pred.chunk(2, dim=1)
+
             # 2. perform guidance
             if do_classifier_free_guidance:
-                noise_pred_out = noise_pred.chunk(2)
-                noise_pred_uncond, noise_pred_text = noise_pred_out[0], noise_pred_out[1]
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + source_guidance_scale * (noise_pred_text - noise_pred_uncond)
 
             xtm1 = xts[idx]
-            # print("noise_pred.shape", noise_pred.shape)
-            # print("xtm1.shape", xtm1.shape)
-            # print("xt.shape", xt.shape)
-            # print("t.shape", t.shape)
-            # print("zs[idx].shape", zs[idx].shape)
-            # print("self.eta", self.eta)
-            noise_pred = noise_pred[:, :4, ]  # todo fix noise pred shape get [1, 8, 128, 128] instead of [1, 4, 128, 128]
             z, xtm1_corrected = compute_noise(self.scheduler, xtm1, xt, t, noise_pred, self.eta)
             zs[idx] = z
 
@@ -1679,7 +1653,7 @@ def compute_noise_ddim(scheduler, prev_latents, latents, timestep, noise_pred, e
     std_dev_t = eta * variance ** (0.5)
 
     # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-    pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t ** 2) ** (0.5) * noise_pred
+    pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * noise_pred
 
     # modifed so that updated xtm1 is returned as well (to avoid error accumulation)
     mu_xt = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
@@ -1688,7 +1662,7 @@ def compute_noise_ddim(scheduler, prev_latents, latents, timestep, noise_pred, e
     else:
         noise = torch.tensor([0.0]).to(latents.device)
 
-    return noise, mu_xt + (eta * variance ** 0.5) * noise
+    return noise, mu_xt + (eta * variance**0.5) * noise
 
 
 # Copied from diffusers.pipelines.ledits_pp.pipeline_leditspp_stable_diffusion.compute_noise_sde_dpm_pp_2nd
