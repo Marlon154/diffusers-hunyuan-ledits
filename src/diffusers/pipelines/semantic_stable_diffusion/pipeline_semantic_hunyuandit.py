@@ -795,7 +795,7 @@ class HunyuanDiTSEGAPipeline(DiffusionPipeline):
                 if self.interrupt:
                     continue
 
-                latent_model_input = torch.cat([latents] * (2 +enabled_editing_prompts)) if do_classifier_free_guidance else latents
+                latent_model_input = torch.cat([latents] * (2 + enabled_editing_prompts)) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # expand scalar t to 1-D tensor to match the 1st dim of latent_model_input
