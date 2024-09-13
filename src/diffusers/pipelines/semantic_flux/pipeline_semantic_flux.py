@@ -13,6 +13,10 @@
 # limitations under the License.
 
 import inspect
+import os
+
+from PIL import Image
+from torchvision.utils import save_image  # todo
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
@@ -52,7 +56,7 @@ EXAMPLE_DOC_STRING = """
         >>> import torch
         >>> from diffusers import SemanticFluxPipeline
 
-        >>> pipe = SemanticFluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
+        >>> pipe = SemanticFluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16)
         >>> pipe.to("cuda")
         >>> prompt = "A cat holding a sign that says hello world"
         >>> # Depending on the variant being used, the pipeline call will slightly vary.
@@ -725,13 +729,9 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
             editing_prompt_embeds=editing_prompt_embeds,
         )
 
-        if self.do_classifier_free_guidance:
-            if enable_edit_guidance:
-                prompt_embeds = torch.cat([prompt_embeds, prompt_embeds, editing_prompt_embeds], dim=0)
-                pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, pooled_prompt_embeds, pooled_editing_prompt], dim=0)
-            else:
-                prompt_embeds = torch.cat([prompt_embeds, prompt_embeds], dim=0)
-                pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+        if enable_edit_guidance:
+            prompt_embeds = torch.cat([prompt_embeds, editing_prompt_embeds], dim=0)
+            pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, pooled_editing_prompt], dim=0)
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
@@ -784,7 +784,7 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                 else:
                     guidance = None
 
-                latent_model_input = torch.cat([latents] * (2 + enabled_editing_prompts)) if self.do_classifier_free_guidance else latents
+                latent_model_input = torch.cat([latents] * (1 + enabled_editing_prompts)) if self.do_classifier_free_guidance else latents
 
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
@@ -800,12 +800,13 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
-                    noise_pred_out = noise_pred.chunk(2 + enabled_editing_prompts)
-                    noise_pred_uncond, noise_pred_text = noise_pred_out[0], noise_pred_out[1]
-                    noise_pred_edit_concepts = noise_pred_out[2:]
+                    noise_pred_out = noise_pred.chunk(1 + enabled_editing_prompts)
+                    noise_pred_text = noise_pred_out[0]
+                    noise_pred_uncond = noise_pred_text
+                    noise_pred_edit_concepts = noise_pred_out[1:]
 
                     # default text guidance
-                    noise_guidance = guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    noise_guidance = noise_pred_text
 
                     if edit_momentum is None:
                         edit_momentum = torch.zeros_like(noise_guidance)
@@ -858,7 +859,7 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                                 noise_guidance_edit[c, :, :, :] = torch.zeros_like(noise_pred_edit_concept)
                                 continue
 
-                            noise_guidance_edit_tmp = noise_pred_edit_concept - noise_pred_uncond
+                            noise_guidance_edit_tmp = noise_pred_edit_concept - noise_pred_text  # simple sega
                             # tmp_weights = (noise_pred_text - noise_pred_edit_concept).sum(dim=(1, 2, 3))
                             tmp_weights = (noise_guidance - noise_pred_edit_concept).sum(dim=(1, 2))
 
@@ -939,7 +940,7 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                         edit_guidance = sem_guidance[i].to(device)
                         noise_guidance = noise_guidance + edit_guidance
 
-                    noise_pred = noise_pred_uncond + noise_guidance
+                    noise_pred = noise_guidance # simple sega
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
